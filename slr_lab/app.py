@@ -53,18 +53,71 @@ def get_client():
     return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"], max_retries=4)
 
 
-def _structured(schema):
-    """Tool definition that forces Claude to return data matching `schema` (validated by the API)."""
-    return dict(tools=[{"name": "submit", "description": "Submit the answer in the required structure.",
-                        "input_schema": schema}],
-                tool_choice={"type": "tool", "name": "submit"})
+
+# ---------------------------------------------------------------- structured output helpers
+_STRUCT = {"ok": True}  # flips to False if the model rejects output_config.format
+
+
+def strict(schema):
+    """Copy of a JSON schema with every object closed and every property required (API requirement)."""
+    if isinstance(schema, dict):
+        out = {k: strict(v) for k, v in schema.items()}
+        if out.get("type") == "object" and "properties" in out:
+            out["additionalProperties"] = False
+            out["required"] = list(out["properties"].keys())
+        return out
+    if isinstance(schema, list):
+        return [strict(x) for x in schema]
+    return schema
+
+
+def parse_json(text):
+    """Best-effort JSON extraction from free text (fallback path only)."""
+    if not text:
+        return None
+    t = re.sub(r"```(?:json)?", "", text).strip()
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        pass
+    starts = sorted((i, o, c) for o, c in (("{", "}"), ("[", "]")) if (i := t.find(o)) != -1)
+    for i, o, c in starts:
+        j = t.rfind(c)
+        if j > i:
+            try:
+                return json.loads(t[i:j + 1])
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def structured_call(system, messages, schema, max_tokens):
+    """Returns (data or None, response). Uses API-enforced JSON, falling back to prompted JSON."""
+    client = get_client()
+    if _STRUCT["ok"]:
+        try:
+            r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=system, messages=messages,
+                                       output_config={"format": {"type": "json_schema", "schema": strict(schema)}})
+            text = "".join(b.text for b in r.content if b.type == "text")
+            return parse_json(text), r
+        except anthropic.BadRequestError as e:
+            msg = str(e).lower()
+            if not any(k in msg for k in ("output_config", "format", "json_schema", "schema")):
+                raise
+            _STRUCT["ok"] = False
+    sys2 = (system + "\n\nReply with one JSON value only, no prose and no code fences. "
+            "It must match this JSON schema:\n" + json.dumps(schema))
+    r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=sys2, messages=messages)
+    data = parse_json("".join(b.text for b in r.content if b.type == "text"))
+    if data is None:  # one retry
+        r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=sys2, messages=messages)
+        data = parse_json("".join(b.text for b in r.content if b.type == "text"))
+    return data, r
 
 
 def _create_json(system, user, schema, max_tokens):
     """Thread-safe structured call. Returns (dict or None, in_tokens, out_tokens)."""
-    r = get_client().messages.create(model=MODEL, max_tokens=max_tokens, system=system,
-                                     messages=[{"role": "user", "content": user}], **_structured(schema))
-    data = next((b.input for b in r.content if b.type == "tool_use"), None)
+    data, r = structured_call(system, [{"role": "user", "content": user}], schema, max_tokens)
     return data, r.usage.input_tokens, r.usage.output_tokens
 
 
@@ -116,20 +169,6 @@ def ask(system, user, purpose, max_tokens=1500, temperature=None, schema=None):
         return None
     record(1, tin, tout, purpose)
     return text
-
-
-def parse_json(text):
-    if text is None:
-        return None
-    t = re.sub(r"```(?:json)?", "", text).strip()
-    for opener, closer in (("[", "]"), ("{", "}")):
-        i, j = t.find(opener), t.rfind(closer)
-        if i != -1 and j > i:
-            try:
-                return json.loads(t[i:j + 1])
-            except json.JSONDecodeError:
-                continue
-    return None
 
 
 def cost(tin, tout):
