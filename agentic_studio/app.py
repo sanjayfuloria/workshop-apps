@@ -86,6 +86,29 @@ def parse_json(text):
     return None
 
 
+def coerce(data, schema):
+    """Normalise common reply shapes (JSON in a string, one-item list, single wrapper key) to match `schema`."""
+    want = schema.get("type")
+    props = set(schema.get("properties", {}))
+    for _ in range(4):
+        if isinstance(data, str):
+            data = parse_json(data)
+        elif isinstance(data, list) and want == "object" and len(data) == 1:
+            data = data[0]
+        elif isinstance(data, list) and want == "object" and len(props) == 1:
+            data = {next(iter(props)): data}
+        elif isinstance(data, dict) and want == "object" and props and not (props & set(data)) and len(data) == 1:
+            data = next(iter(data.values()))
+        else:
+            break
+    if want == "object" and not isinstance(data, dict):
+        return None
+    return data
+
+
+_LAST = {"text": ""}  # last raw structured reply, shown to the user if parsing fails
+
+
 def structured_call(system, messages, schema, max_tokens):
     """Returns (data or None, response). Uses API-enforced JSON, falling back to prompted JSON."""
     client = get_client()
@@ -94,7 +117,8 @@ def structured_call(system, messages, schema, max_tokens):
             r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=system, messages=messages,
                                        output_config={"format": {"type": "json_schema", "schema": strict(schema)}})
             text = "".join(b.text for b in r.content if b.type == "text")
-            return parse_json(text), r
+            _LAST["text"] = text
+            return coerce(parse_json(text), schema), r
         except anthropic.BadRequestError as e:
             msg = str(e).lower()
             if not any(k in msg for k in ("output_config", "format", "json_schema", "schema")):
@@ -103,10 +127,13 @@ def structured_call(system, messages, schema, max_tokens):
     sys2 = (system + "\n\nReply with one JSON value only, no prose and no code fences. "
             "It must match this JSON schema:\n" + json.dumps(schema))
     r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=sys2, messages=messages)
-    data = parse_json("".join(b.text for b in r.content if b.type == "text"))
+    text = "".join(b.text for b in r.content if b.type == "text")
+    data = coerce(parse_json(text), schema)
     if data is None:  # one retry
         r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=sys2, messages=messages)
-        data = parse_json("".join(b.text for b in r.content if b.type == "text"))
+        text = "".join(b.text for b in r.content if b.type == "text")
+        data = coerce(parse_json(text), schema)
+    _LAST["text"] = text
     return data, r
 
 
@@ -164,7 +191,12 @@ def ask(system, user, purpose, max_tokens=1500, temperature=None, schema=None):
         return None
     note(purpose, 1, r.usage.input_tokens, r.usage.output_tokens)
     if schema:
-        return tool_data(r)
+        data = tool_data(r)
+        if data is None:
+            st.warning("The model replied, but not in the expected format. Please try again.")
+            with st.expander("Show the raw reply (for the facilitator)"):
+                st.code(_LAST["text"][:4000] or "(empty)", language=None)
+        return data
     return "".join(b.text for b in r.content if b.type == "text")
 
 
@@ -226,12 +258,14 @@ Pharmacy owner, 29, Anantapur city. B.Pharm. Very comfortable with digital tools
 
 def run_writer(extra=""):
     out = ask(WRITER_SYS, f"{STUDY}\nWrite {n_items} items.\n{extra}", "writer", 2500, schema=ITEMS_SCHEMA)
-    return out.get("items") if isinstance(out, dict) else None
+    items = out.get("items") if isinstance(out, dict) else None
+    return [i for i in items if isinstance(i, dict) and i.get("text")] if isinstance(items, list) else None
 
 
 def run_critic(items):
     out = ask(CRITIC_SYS, f"{STUDY}\nItems:\n{json.dumps(items, ensure_ascii=False)}", "critic", 3000, schema=REVIEW_SCHEMA)
-    return out.get("reviews") if isinstance(out, dict) else None
+    rv = out.get("reviews") if isinstance(out, dict) else None
+    return [x for x in rv if isinstance(x, dict) and x.get("id")] if isinstance(rv, list) else None
 
 
 def run_pilot(items, personas):
@@ -341,7 +375,7 @@ with tabs[3]:
     if st.session_state.itemset and st.button("Translate and back-translate", type="primary") and can_call(2):
         src = [{"id": i["id"], "text": i["text"]} for i in st.session_state.itemset]
         fwd = (ask(f"You translate survey items into everyday spoken {lang} suitable for the population. Keep meaning, not word order. Keep each item id.",
-                   f"Population: {population}\nItems:\n{json.dumps(src, ensure_ascii=False)}", "translator", 3000, schema=PAIR_SCHEMA) or {}).get("items")
+                   f"Population: {population}\nItems:\n{json.dumps(src, ensure_ascii=False)}", "translator", 3000, schema=PAIR_SCHEMA) or {}).get("items") or None
         back = (ask("You translate survey items into plain English. Keep each item id.",
                     json.dumps(fwd, ensure_ascii=False), "back-translator", 2000, schema=PAIR_SCHEMA) or {}).get("items") if fwd else None
         if fwd and back:
