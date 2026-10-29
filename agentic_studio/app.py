@@ -47,12 +47,19 @@ def get_client():
     return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"], max_retries=4)
 
 
-def raw(system, messages, max_tokens=1500, temperature=None, tools=None):
+def raw(system, messages, max_tokens=1500, temperature=None, tools=None, schema=None):
     # temperature is accepted for compatibility but not sent: current models do not expose it.
     kw = dict(model=MODEL, max_tokens=max_tokens, system=system, messages=messages)
     if tools:
         kw["tools"] = tools
+    if schema:  # force a validated structured reply via a single required tool
+        kw["tools"] = [{"name": "submit", "description": "Submit the answer in the required structure.", "input_schema": schema}]
+        kw["tool_choice"] = {"type": "tool", "name": "submit"}
     return get_client().messages.create(**kw)
+
+
+def tool_data(r):
+    return next((b.input for b in r.content if b.type == "tool_use"), None)
 
 
 def note(purpose, n, tin, tout, detail=None):
@@ -73,11 +80,12 @@ def can_call(n=1):
     return True
 
 
-def ask(system, user, purpose, max_tokens=1500, temperature=None):
+def ask(system, user, purpose, max_tokens=1500, temperature=None, schema=None):
+    """Plain text reply, or a validated dict when `schema` is given."""
     if not can_call():
         return None
     try:
-        r = raw(system, [{"role": "user", "content": user}], max_tokens, temperature)
+        r = raw(system, [{"role": "user", "content": user}], max_tokens, schema=schema)
     except anthropic.RateLimitError:
         st.error("The API is busy. Wait 30 seconds and try again.")
         return None
@@ -91,6 +99,8 @@ def ask(system, user, purpose, max_tokens=1500, temperature=None):
         st.error(f"Unexpected error ({e.__class__.__name__}). Please tell the facilitator.")
         return None
     note(purpose, 1, r.usage.input_tokens, r.usage.output_tokens)
+    if schema:
+        return tool_data(r)
     return "".join(b.text for b in r.content if b.type == "text")
 
 
@@ -137,11 +147,26 @@ STUDY = f"Construct: {construct}\nDefinition: {definition}\nPopulation and conte
 # ---------------------------------------------------------------- agent prompts
 WRITER_SYS = """You are the ITEM WRITER agent on a survey design team.
 Write clear, single-idea items suited to the population. Prefer adapting items from well-known validated scales and name the scale family you adapted from, but say "new item" when you are not adapting. Never invent citations.
-Return JSON only: [{"id": "T1", "text": "...", "reverse_coded": false, "source_note": "adapted from <scale family> | new item"}]"""
+Use ids T1, T2 and so on."""
 CRITIC_SYS = """You are the CRITIC agent on a survey design team. Review each item for: leading wording, double-barrelled items, jargon or reading level too high for the population, vague terms, cultural or contextual mismatch, and drift away from the construct definition.
-Return JSON only: [{"id": "T1", "issues": ["..."], "severity": "none|low|high", "suggested_rewrite": "..."}]"""
+Give a severity of none, low or high, and a suggested rewrite for each item."""
 PERSONA_SYS = """You are simulating one survey respondent for a PRETEST only. Stay in the persona. For each item, give the rating you would most likely choose and explain in one plain sentence how you understood the question, including any confusion.
-Return JSON only: [{"id": "T1", "rating": 1, "understood_as": "...", "confusing": false}]"""
+Ratings are whole numbers on the response scale."""
+
+STR = {"type": "string"}
+ITEM = {"type": "object", "required": ["id", "text", "reverse_coded", "source_note"], "properties": {
+    "id": STR, "text": STR, "reverse_coded": {"type": "boolean"},
+    "source_note": {"type": "string", "description": "adapted from <scale family>, or new item"}}}
+ITEMS_SCHEMA = {"type": "object", "required": ["items"], "properties": {"items": {"type": "array", "items": ITEM}}}
+REVIEW_SCHEMA = {"type": "object", "required": ["reviews"], "properties": {"reviews": {"type": "array", "items": {
+    "type": "object", "required": ["id", "issues", "severity", "suggested_rewrite"], "properties": {
+        "id": STR, "issues": {"type": "array", "items": STR},
+        "severity": {"type": "string", "enum": ["none", "low", "high"]}, "suggested_rewrite": STR}}}}}
+ANSWER_SCHEMA = {"type": "object", "required": ["answers"], "properties": {"answers": {"type": "array", "items": {
+    "type": "object", "required": ["id", "rating", "understood_as", "confusing"], "properties": {
+        "id": STR, "rating": {"type": "integer"}, "understood_as": STR, "confusing": {"type": "boolean"}}}}}}
+PAIR_SCHEMA = {"type": "object", "required": ["items"], "properties": {"items": {"type": "array", "items": {
+    "type": "object", "required": ["id", "text"], "properties": {"id": STR, "text": STR}}}}}
 
 DEFAULT_PERSONAS = """Kirana owner, 52, Anantapur town. Studied to Class 10. Prefers Telugu. Accepts UPI from some customers but keeps mostly cash.
 Hardware shop owner, 34, Dharmavaram. Graduate. Uses a billing app and UPI daily.
@@ -150,13 +175,13 @@ Pharmacy owner, 29, Anantapur city. B.Pharm. Very comfortable with digital tools
 
 
 def run_writer(extra=""):
-    out = parse_json(ask(WRITER_SYS, f"{STUDY}\nWrite {n_items} items.\n{extra}", "writer", 1800))
-    return out if isinstance(out, list) else None
+    out = ask(WRITER_SYS, f"{STUDY}\nWrite {n_items} items.\n{extra}", "writer", 2500, schema=ITEMS_SCHEMA)
+    return out.get("items") if isinstance(out, dict) else None
 
 
 def run_critic(items):
-    out = parse_json(ask(CRITIC_SYS, f"{STUDY}\nItems:\n{json.dumps(items, ensure_ascii=False)}", "critic", 2200))
-    return out if isinstance(out, list) else None
+    out = ask(CRITIC_SYS, f"{STUDY}\nItems:\n{json.dumps(items, ensure_ascii=False)}", "critic", 3000, schema=REVIEW_SCHEMA)
+    return out.get("reviews") if isinstance(out, dict) else None
 
 
 def run_pilot(items, personas):
@@ -167,8 +192,8 @@ def run_pilot(items, personas):
         try:
             r = raw(PERSONA_SYS + f"\nPersona: {p}",
                     [{"role": "user", "content": f"Response scale: {scale}\nItems:\n{json.dumps(items, ensure_ascii=False)}"}],
-                    1500, 1.0)
-            return p, parse_json("".join(b.text for b in r.content if b.type == "text")), r.usage.input_tokens, r.usage.output_tokens
+                    2000, schema=ANSWER_SCHEMA)
+            return p, (tool_data(r) or {}).get("answers"), r.usage.input_tokens, r.usage.output_tokens
         except Exception:  # noqa: BLE001
             return p, None, 0, 0
 
@@ -265,10 +290,10 @@ with tabs[3]:
     lang = st.selectbox("Target language", ["Telugu", "Hindi", "Kannada", "Tamil"])
     if st.session_state.itemset and st.button("Translate and back-translate", type="primary") and can_call(2):
         src = [{"id": i["id"], "text": i["text"]} for i in st.session_state.itemset]
-        fwd = parse_json(ask(f"You translate survey items into everyday spoken {lang} suitable for the population. Keep meaning, not word order. Return JSON only: [{{\"id\": \"T1\", \"text\": \"...\"}}]",
-                             f"Population: {population}\nItems:\n{json.dumps(src, ensure_ascii=False)}", "translator", 2000))
-        back = parse_json(ask("You translate survey items into plain English. Return JSON only: [{\"id\": \"T1\", \"text\": \"...\"}]",
-                              json.dumps(fwd, ensure_ascii=False), "back-translator", 1500)) if fwd else None
+        fwd = (ask(f"You translate survey items into everyday spoken {lang} suitable for the population. Keep meaning, not word order. Keep each item id.",
+                   f"Population: {population}\nItems:\n{json.dumps(src, ensure_ascii=False)}", "translator", 3000, schema=PAIR_SCHEMA) or {}).get("items")
+        back = (ask("You translate survey items into plain English. Keep each item id.",
+                    json.dumps(fwd, ensure_ascii=False), "back-translator", 2000, schema=PAIR_SCHEMA) or {}).get("items") if fwd else None
         if fwd and back:
             bmap = {b["id"]: b["text"] for b in back}
             fmap = {f["id"]: f["text"] for f in fwd}
