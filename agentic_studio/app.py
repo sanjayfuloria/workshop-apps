@@ -114,8 +114,12 @@ def structured_call(system, messages, schema, max_tokens):
     client = get_client()
     if _STRUCT["ok"]:
         try:
+            fmt = {"format": {"type": "json_schema", "schema": strict(schema)}}
             r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=system, messages=messages,
-                                       output_config={"format": {"type": "json_schema", "schema": strict(schema)}})
+                                       output_config=fmt)
+            if getattr(r, "stop_reason", None) == "max_tokens":  # reply was cut off: retry with more room
+                r = client.messages.create(model=MODEL, max_tokens=min(max_tokens * 2, 16000), system=system,
+                                           messages=messages, output_config=fmt)
             text = "".join(b.text for b in r.content if b.type == "text")
             _LAST["text"] = text
             return coerce(parse_json(text), schema), r
@@ -129,8 +133,9 @@ def structured_call(system, messages, schema, max_tokens):
     r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=sys2, messages=messages)
     text = "".join(b.text for b in r.content if b.type == "text")
     data = coerce(parse_json(text), schema)
-    if data is None:  # one retry
-        r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=sys2, messages=messages)
+    if data is None:  # one retry, with more room if the reply was cut off
+        room = min(max_tokens * 2, 16000) if getattr(r, "stop_reason", None) == "max_tokens" else max_tokens
+        r = client.messages.create(model=MODEL, max_tokens=room, system=sys2, messages=messages)
         text = "".join(b.text for b in r.content if b.type == "text")
         data = coerce(parse_json(text), schema)
     _LAST["text"] = text
@@ -195,7 +200,7 @@ def ask(system, user, purpose, max_tokens=1500, temperature=None, schema=None):
         if data is None:
             st.warning("The model replied, but not in the expected format. Please try again.")
             with st.expander("Show the raw reply (for the facilitator)"):
-                st.code(_LAST["text"][:4000] or "(empty)", language=None)
+                st.code(_LAST["text"][:12000] or "(empty)", language=None)
         return data
     return "".join(b.text for b in r.content if b.type == "text")
 
@@ -257,13 +262,13 @@ Pharmacy owner, 29, Anantapur city. B.Pharm. Very comfortable with digital tools
 
 
 def run_writer(extra=""):
-    out = ask(WRITER_SYS, f"{STUDY}\nWrite {n_items} items.\n{extra}", "writer", 2500, schema=ITEMS_SCHEMA)
+    out = ask(WRITER_SYS, f"{STUDY}\nWrite {n_items} items.\n{extra}", "writer", 6000, schema=ITEMS_SCHEMA)
     items = out.get("items") if isinstance(out, dict) else None
     return [i for i in items if isinstance(i, dict) and i.get("text")] if isinstance(items, list) else None
 
 
 def run_critic(items):
-    out = ask(CRITIC_SYS, f"{STUDY}\nItems:\n{json.dumps(items, ensure_ascii=False)}", "critic", 3000, schema=REVIEW_SCHEMA)
+    out = ask(CRITIC_SYS, f"{STUDY}\nItems:\n{json.dumps(items, ensure_ascii=False)}", "critic", 8000, schema=REVIEW_SCHEMA)
     rv = out.get("reviews") if isinstance(out, dict) else None
     return [x for x in rv if isinstance(x, dict) and x.get("id")] if isinstance(rv, list) else None
 
@@ -276,7 +281,7 @@ def run_pilot(items, personas):
         try:
             r = raw(PERSONA_SYS + f"\nPersona: {p}",
                     [{"role": "user", "content": f"Response scale: {scale}\nItems:\n{json.dumps(items, ensure_ascii=False)}"}],
-                    2000, schema=ANSWER_SCHEMA)
+                    4000, schema=ANSWER_SCHEMA)
             return p, (tool_data(r) or {}).get("answers"), r.usage.input_tokens, r.usage.output_tokens
         except Exception:  # noqa: BLE001
             return p, None, 0, 0
@@ -375,9 +380,9 @@ with tabs[3]:
     if st.session_state.itemset and st.button("Translate and back-translate", type="primary") and can_call(2):
         src = [{"id": i["id"], "text": i["text"]} for i in st.session_state.itemset]
         fwd = (ask(f"You translate survey items into everyday spoken {lang} suitable for the population. Keep meaning, not word order. Keep each item id.",
-                   f"Population: {population}\nItems:\n{json.dumps(src, ensure_ascii=False)}", "translator", 3000, schema=PAIR_SCHEMA) or {}).get("items") or None
+                   f"Population: {population}\nItems:\n{json.dumps(src, ensure_ascii=False)}", "translator", 6000, schema=PAIR_SCHEMA) or {}).get("items") or None
         back = (ask("You translate survey items into plain English. Keep each item id.",
-                    json.dumps(fwd, ensure_ascii=False), "back-translator", 2000, schema=PAIR_SCHEMA) or {}).get("items") if fwd else None
+                    json.dumps(fwd, ensure_ascii=False), "back-translator", 4000, schema=PAIR_SCHEMA) or {}).get("items") if fwd else None
         if fwd and back:
             bmap = {b["id"]: b["text"] for b in back}
             fmap = {f["id"]: f["text"] for f in fwd}
@@ -450,7 +455,7 @@ with tabs[5]:
             if not can_call(1):
                 break
             try:
-                r = raw(ORCH_SYS.format(n=n_items) + "\n\nStudy:\n" + STUDY, msgs, 3000, tools=TOOLS)
+                r = raw(ORCH_SYS.format(n=n_items) + "\n\nStudy:\n" + STUDY, msgs, 8000, tools=TOOLS)
             except Exception as e:  # noqa: BLE001
                 box.write(f"⚠️ API error: {e}")
                 break
@@ -516,7 +521,7 @@ with tabs[6]:
                  "synthetic_personas_used": st.session_state.pilot is not None, "reflexive_note": reflection}
         txt = ask("You write accurate research ethics and methods text. Use only the facts given. Do not invent results or citations.",
                   f"Facts:\n{json.dumps(facts, indent=2)}\n\nWrite three short paragraphs with headings: 'For the ethics committee', 'For the journal methods section', 'For respondents (consent form wording)'. State clearly that synthetic personas were used only for pretesting and are not part of the results, if they were used. Plain English, short sentences.",
-                  "disclosure", 900)
+                  "disclosure", 2500)
         if txt:
             st.markdown(txt)
 
