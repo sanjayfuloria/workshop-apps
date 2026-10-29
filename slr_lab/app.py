@@ -55,18 +55,9 @@ def get_client():
 
 def _create(system, user, max_tokens, temperature):
     """Thread-safe raw call. Returns (text, in_tokens, out_tokens)."""
-    kw = dict(model=MODEL, max_tokens=max_tokens, system=system,
-              messages=[{"role": "user", "content": user}])
-    if temperature is not None:
-        kw["temperature"] = temperature
-    try:
-        r = get_client().messages.create(**kw)
-    except anthropic.BadRequestError as e:
-        if "temperature" in str(e).lower():
-            kw.pop("temperature", None)
-            r = get_client().messages.create(**kw)
-        else:
-            raise
+    # temperature is accepted for compatibility but not sent: current models do not expose it.
+    r = get_client().messages.create(model=MODEL, max_tokens=max_tokens, system=system,
+                                     messages=[{"role": "user", "content": user}])
     text = "".join(b.text for b in r.content if b.type == "text")
     return text, r.usage.input_tokens, r.usage.output_tokens
 
@@ -95,8 +86,14 @@ def ask(system, user, purpose, max_tokens=1500, temperature=0.0):
     except anthropic.RateLimitError:
         st.error("The API is busy right now. Wait 30 seconds and try again.")
         return None
+    except anthropic.AuthenticationError:
+        st.error("The API key was rejected. The facilitator should check ANTHROPIC_API_KEY in the app secrets.")
+        return None
     except anthropic.APIError as e:
         st.error(f"API error: {e}")
+        return None
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Unexpected error ({e.__class__.__name__}). Please tell the facilitator.")
         return None
     record(1, tin, tout, purpose)
     return text
@@ -309,8 +306,8 @@ with tabs[2]:
         res = st.session_state.screen["df"]
         ids = st.multiselect("Pick records to rerun (start with borderline ones)", res["id"].tolist(), default=res["id"].tolist()[:5])
         runs = st.slider("Runs per record", 2, 5, 3)
-        temp = st.select_slider("Temperature", options=[0.0, 0.5, 1.0], value=1.0,
-                                help="Higher temperature means more random sampling. Some models may ignore this setting.")
+        st.caption("Current Claude models do not let you fix a 'temperature' setting, so you cannot force identical answers. That is exactly why logging and repeated runs matter.")
+        temp = None
         total = len(ids) * runs
         if st.button(f"Rerun ({total} calls)") and ids and can_call(total):
             sysp = st.session_state.screen["system"]
@@ -326,7 +323,7 @@ with tabs[2]:
             with st.spinner("Rerunning..."):
                 with ThreadPoolExecutor(max_workers=4) as ex:
                     out = list(ex.map(rerun, jobs))
-            record(total, sum(o[2] for o in out), sum(o[3] for o in out), f"reproducibility rerun temp={temp}")
+            record(total, sum(o[2] for o in out), sum(o[3] for o in out), "reproducibility rerun")
             tab = pd.DataFrame([(o[0], o[1]) for o in out], columns=["id", "decision"])
             summ = tab.groupby("id")["decision"].agg(lambda s: ", ".join(s)).reset_index(name="decisions across runs")
             summ["stable"] = tab.groupby("id")["decision"].nunique().values == 1

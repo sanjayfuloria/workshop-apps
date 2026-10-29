@@ -48,18 +48,11 @@ def get_client():
 
 
 def raw(system, messages, max_tokens=1500, temperature=None, tools=None):
+    # temperature is accepted for compatibility but not sent: current models do not expose it.
     kw = dict(model=MODEL, max_tokens=max_tokens, system=system, messages=messages)
-    if temperature is not None:
-        kw["temperature"] = temperature
     if tools:
         kw["tools"] = tools
-    try:
-        return get_client().messages.create(**kw)
-    except anthropic.BadRequestError as e:
-        if "temperature" in str(e).lower() and "temperature" in kw:
-            kw.pop("temperature")
-            return get_client().messages.create(**kw)
-        raise
+    return get_client().messages.create(**kw)
 
 
 def note(purpose, n, tin, tout, detail=None):
@@ -88,8 +81,14 @@ def ask(system, user, purpose, max_tokens=1500, temperature=None):
     except anthropic.RateLimitError:
         st.error("The API is busy. Wait 30 seconds and try again.")
         return None
+    except anthropic.AuthenticationError:
+        st.error("The API key was rejected. The facilitator should check ANTHROPIC_API_KEY in the app secrets.")
+        return None
     except anthropic.APIError as e:
         st.error(f"API error: {e}")
+        return None
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Unexpected error ({e.__class__.__name__}). Please tell the facilitator.")
         return None
     note(purpose, 1, r.usage.input_tokens, r.usage.output_tokens)
     return "".join(b.text for b in r.content if b.type == "text")
@@ -343,7 +342,7 @@ with tabs[5]:
                 break
             try:
                 r = raw(ORCH_SYS.format(n=n_items) + "\n\nStudy:\n" + STUDY, msgs, 3000, tools=TOOLS)
-            except anthropic.APIError as e:
+            except Exception as e:  # noqa: BLE001
                 box.write(f"⚠️ API error: {e}")
                 break
             note("orchestrator", 1, r.usage.input_tokens, r.usage.output_tokens)
