@@ -6,6 +6,7 @@ Run locally:  streamlit run app.py
 Secrets (.streamlit/secrets.toml): ANTHROPIC_API_KEY, ACCESS_CODE, optional MODEL, MAX_CALLS
 """
 import json
+from types import SimpleNamespace
 import re
 import difflib
 import statistics
@@ -47,19 +48,82 @@ def get_client():
     return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"], max_retries=4)
 
 
+
+# ---------------------------------------------------------------- structured output helpers
+_STRUCT = {"ok": True}  # flips to False if the model rejects output_config.format
+
+
+def strict(schema):
+    """Copy of a JSON schema with every object closed and every property required (API requirement)."""
+    if isinstance(schema, dict):
+        out = {k: strict(v) for k, v in schema.items()}
+        if out.get("type") == "object" and "properties" in out:
+            out["additionalProperties"] = False
+            out["required"] = list(out["properties"].keys())
+        return out
+    if isinstance(schema, list):
+        return [strict(x) for x in schema]
+    return schema
+
+
+def parse_json(text):
+    """Best-effort JSON extraction from free text (fallback path only)."""
+    if not text:
+        return None
+    t = re.sub(r"```(?:json)?", "", text).strip()
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        pass
+    starts = sorted((i, o, c) for o, c in (("{", "}"), ("[", "]")) if (i := t.find(o)) != -1)
+    for i, o, c in starts:
+        j = t.rfind(c)
+        if j > i:
+            try:
+                return json.loads(t[i:j + 1])
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def structured_call(system, messages, schema, max_tokens):
+    """Returns (data or None, response). Uses API-enforced JSON, falling back to prompted JSON."""
+    client = get_client()
+    if _STRUCT["ok"]:
+        try:
+            r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=system, messages=messages,
+                                       output_config={"format": {"type": "json_schema", "schema": strict(schema)}})
+            text = "".join(b.text for b in r.content if b.type == "text")
+            return parse_json(text), r
+        except anthropic.BadRequestError as e:
+            msg = str(e).lower()
+            if not any(k in msg for k in ("output_config", "format", "json_schema", "schema")):
+                raise
+            _STRUCT["ok"] = False
+    sys2 = (system + "\n\nReply with one JSON value only, no prose and no code fences. "
+            "It must match this JSON schema:\n" + json.dumps(schema))
+    r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=sys2, messages=messages)
+    data = parse_json("".join(b.text for b in r.content if b.type == "text"))
+    if data is None:  # one retry
+        r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=sys2, messages=messages)
+        data = parse_json("".join(b.text for b in r.content if b.type == "text"))
+    return data, r
+
+
 def raw(system, messages, max_tokens=1500, temperature=None, tools=None, schema=None):
+    """Plain call (optionally with tools). With `schema`, returns a response carrying `.data`."""
     # temperature is accepted for compatibility but not sent: current models do not expose it.
+    if schema:
+        data, r = structured_call(system, messages, schema, max_tokens)
+        return SimpleNamespace(data=data, usage=r.usage, content=r.content)
     kw = dict(model=MODEL, max_tokens=max_tokens, system=system, messages=messages)
     if tools:
         kw["tools"] = tools
-    if schema:  # force a validated structured reply via a single required tool
-        kw["tools"] = [{"name": "submit", "description": "Submit the answer in the required structure.", "input_schema": schema}]
-        kw["tool_choice"] = {"type": "tool", "name": "submit"}
     return get_client().messages.create(**kw)
 
 
 def tool_data(r):
-    return next((b.input for b in r.content if b.type == "tool_use"), None)
+    return getattr(r, "data", None)
 
 
 def note(purpose, n, tin, tout, detail=None):
@@ -102,20 +166,6 @@ def ask(system, user, purpose, max_tokens=1500, temperature=None, schema=None):
     if schema:
         return tool_data(r)
     return "".join(b.text for b in r.content if b.type == "text")
-
-
-def parse_json(text):
-    if not text:
-        return None
-    t = re.sub(r"```(?:json)?", "", text).strip()
-    for o, c in (("[", "]"), ("{", "}")):
-        i, j = t.find(o), t.rfind(c)
-        if i != -1 and j > i:
-            try:
-                return json.loads(t[i:j + 1])
-            except json.JSONDecodeError:
-                pass
-    return None
 
 
 def cost(tin, tout):
