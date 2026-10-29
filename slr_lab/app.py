@@ -91,6 +91,29 @@ def parse_json(text):
     return None
 
 
+def coerce(data, schema):
+    """Normalise common reply shapes (JSON in a string, one-item list, single wrapper key) to match `schema`."""
+    want = schema.get("type")
+    props = set(schema.get("properties", {}))
+    for _ in range(4):
+        if isinstance(data, str):
+            data = parse_json(data)
+        elif isinstance(data, list) and want == "object" and len(data) == 1:
+            data = data[0]
+        elif isinstance(data, list) and want == "object" and len(props) == 1:
+            data = {next(iter(props)): data}
+        elif isinstance(data, dict) and want == "object" and props and not (props & set(data)) and len(data) == 1:
+            data = next(iter(data.values()))
+        else:
+            break
+    if want == "object" and not isinstance(data, dict):
+        return None
+    return data
+
+
+_LAST = {"text": ""}  # last raw structured reply, shown to the user if parsing fails
+
+
 def structured_call(system, messages, schema, max_tokens):
     """Returns (data or None, response). Uses API-enforced JSON, falling back to prompted JSON."""
     client = get_client()
@@ -99,7 +122,8 @@ def structured_call(system, messages, schema, max_tokens):
             r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=system, messages=messages,
                                        output_config={"format": {"type": "json_schema", "schema": strict(schema)}})
             text = "".join(b.text for b in r.content if b.type == "text")
-            return parse_json(text), r
+            _LAST["text"] = text
+            return coerce(parse_json(text), schema), r
         except anthropic.BadRequestError as e:
             msg = str(e).lower()
             if not any(k in msg for k in ("output_config", "format", "json_schema", "schema")):
@@ -108,10 +132,13 @@ def structured_call(system, messages, schema, max_tokens):
     sys2 = (system + "\n\nReply with one JSON value only, no prose and no code fences. "
             "It must match this JSON schema:\n" + json.dumps(schema))
     r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=sys2, messages=messages)
-    data = parse_json("".join(b.text for b in r.content if b.type == "text"))
+    text = "".join(b.text for b in r.content if b.type == "text")
+    data = coerce(parse_json(text), schema)
     if data is None:  # one retry
         r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=sys2, messages=messages)
-        data = parse_json("".join(b.text for b in r.content if b.type == "text"))
+        text = "".join(b.text for b in r.content if b.type == "text")
+        data = coerce(parse_json(text), schema)
+    _LAST["text"] = text
     return data, r
 
 
@@ -168,6 +195,10 @@ def ask(system, user, purpose, max_tokens=1500, temperature=None, schema=None):
         st.error(f"Unexpected error ({e.__class__.__name__}). Please tell the facilitator.")
         return None
     record(1, tin, tout, purpose)
+    if schema and text is None:
+        st.warning("The model replied, but not in the expected format. Please try again.")
+        with st.expander("Show the raw reply (for the facilitator)"):
+            st.code(_LAST["text"][:4000] or "(empty)", language=None)
     return text
 
 
@@ -284,8 +315,8 @@ Return JSON only:
   "cautions": ["things the researcher must check by hand"]}}"""
         with st.spinner("Thinking about your concepts..."):
             out = ask(sys, prompt, "search strategy", 3000, schema=SEARCH_SCHEMA)
-        if out:
-            for c in out.get("concepts", []):
+        if isinstance(out, dict):
+            for c in out.get("concepts", []) or []:
                 st.markdown(f"**{c.get('concept','')}**")
                 st.write("Synonyms: " + ", ".join(c.get("synonyms", [])))
                 if c.get("india_specific_terms"):
@@ -298,8 +329,7 @@ Return JSON only:
                 st.info("Check by hand: " + " ".join(out["cautions"]))
             if known.strip():
                 st.caption("Next step: run the string in Scopus and confirm every known item appears. If one is missing, revise the string.")
-        elif out is None:
-            st.caption("No result this time. Please try again.")
+
 
 # 2. Screening lab
 with tabs[1]:
@@ -431,6 +461,7 @@ Return JSON only, a list:
         with st.spinner("Coding..."):
             res = ask(sys, prompt, "qualitative coding", 3000, schema=CODE_SCHEMA)
             out = res.get("codes") if isinstance(res, dict) else None
+            out = [o for o in out if isinstance(o, dict)] if isinstance(out, list) else None
         if isinstance(out, list):
             norm = lambda s: re.sub(r"\s+", " ", s.lower()).strip(' ".')  # noqa: E731
             full = norm(passages)
