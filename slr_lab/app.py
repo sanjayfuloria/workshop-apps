@@ -53,7 +53,22 @@ def get_client():
     return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"], max_retries=4)
 
 
-def _create(system, user, max_tokens, temperature):
+def _structured(schema):
+    """Tool definition that forces Claude to return data matching `schema` (validated by the API)."""
+    return dict(tools=[{"name": "submit", "description": "Submit the answer in the required structure.",
+                        "input_schema": schema}],
+                tool_choice={"type": "tool", "name": "submit"})
+
+
+def _create_json(system, user, schema, max_tokens):
+    """Thread-safe structured call. Returns (dict or None, in_tokens, out_tokens)."""
+    r = get_client().messages.create(model=MODEL, max_tokens=max_tokens, system=system,
+                                     messages=[{"role": "user", "content": user}], **_structured(schema))
+    data = next((b.input for b in r.content if b.type == "tool_use"), None)
+    return data, r.usage.input_tokens, r.usage.output_tokens
+
+
+def _create(system, user, max_tokens, temperature=None):
     """Thread-safe raw call. Returns (text, in_tokens, out_tokens)."""
     # temperature is accepted for compatibility but not sent: current models do not expose it.
     r = get_client().messages.create(model=MODEL, max_tokens=max_tokens, system=system,
@@ -78,11 +93,15 @@ def can_call(n=1):
     return True
 
 
-def ask(system, user, purpose, max_tokens=1500, temperature=0.0):
+def ask(system, user, purpose, max_tokens=1500, temperature=None, schema=None):
+    """Plain text reply, or a validated dict when `schema` is given."""
     if not can_call():
         return None
     try:
-        text, tin, tout = _create(system, user, max_tokens, temperature)
+        if schema:
+            text, tin, tout = _create_json(system, user, schema, max_tokens)
+        else:
+            text, tin, tout = _create(system, user, max_tokens)
     except anthropic.RateLimitError:
         st.error("The API is busy right now. Wait 30 seconds and try again.")
         return None
@@ -168,6 +187,20 @@ RECORDS = [
 ]
 DEFAULT_DF = pd.DataFrame(RECORDS, columns=["id", "title", "abstract", "human_label"])
 
+STR = {"type": "string"}
+STRS = {"type": "array", "items": STR}
+SEARCH_SCHEMA = {"type": "object", "required": ["concepts", "scopus", "web_of_science", "cautions"], "properties": {
+    "concepts": {"type": "array", "items": {"type": "object", "required": ["concept", "synonyms"], "properties": {
+        "concept": STR, "synonyms": STRS, "india_specific_terms": STRS}}},
+    "scopus": STR, "web_of_science": STR, "cautions": STRS}}
+SCREEN_SCHEMA = {"type": "object", "required": ["decision", "criterion", "evidence"], "properties": {
+    "decision": {"type": "string", "enum": ["include", "exclude", "uncertain"]},
+    "criterion": STR, "evidence": {"type": "string", "description": "short exact quote from the abstract"}}}
+CODE_SCHEMA = {"type": "object", "required": ["codes"], "properties": {"codes": {"type": "array", "items": {
+    "type": "object", "required": ["passage", "code", "quote", "rationale"], "properties": {
+        "passage": STR, "code": STR, "quote": {"type": "string", "description": "exact words copied from the passage"},
+        "rationale": STR}}}}}
+
 SCREEN_PROMPT = """You are screening records for a systematic review.
 Review question: {question}
 
@@ -175,8 +208,7 @@ Eligibility criteria:
 {criteria}
 
 Decide for the record below. Use "uncertain" when the abstract does not give enough information.
-Return JSON only, with no other text:
-{{"decision": "include|exclude|uncertain", "criterion": "<criterion number or letter that decided it>", "evidence": "<short exact quote from the abstract>"}}"""
+Give your decision, the criterion number or letter that decided it, and a short exact quote from the abstract as evidence."""
 
 
 def kappa(a, b):
@@ -212,7 +244,7 @@ Return JSON only:
   "web_of_science": "TS=(...) string",
   "cautions": ["things the researcher must check by hand"]}}"""
         with st.spinner("Thinking about your concepts..."):
-            out = parse_json(ask(sys, prompt, "search strategy", 2000))
+            out = ask(sys, prompt, "search strategy", 3000, schema=SEARCH_SCHEMA)
         if out:
             for c in out.get("concepts", []):
                 st.markdown(f"**{c.get('concept','')}**")
@@ -227,8 +259,8 @@ Return JSON only:
                 st.info("Check by hand: " + " ".join(out["cautions"]))
             if known.strip():
                 st.caption("Next step: run the string in Scopus and confirm every known item appears. If one is missing, revise the string.")
-        elif out is None and st.session_state.calls:
-            st.error("The model reply could not be read as JSON. Try again.")
+        elif out is None:
+            st.caption("No result this time. Please try again.")
 
 # 2. Screening lab
 with tabs[1]:
@@ -251,8 +283,8 @@ with tabs[1]:
 
         def work(r):
             try:
-                text, tin, tout = _create(system_prompt, f"Title: {r['title']}\nAbstract: {r['abstract']}", 300, 0.0)
-                return r, parse_json(text) or {"decision": "uncertain", "criterion": "", "evidence": "unparseable reply"}, tin, tout
+                out, tin, tout = _create_json(system_prompt, f"Title: {r['title']}\nAbstract: {r['abstract']}", SCREEN_SCHEMA, 400)
+                return r, out or {"decision": "uncertain", "criterion": "", "evidence": "no structured reply"}, tin, tout
             except Exception as e:  # noqa: BLE001
                 return r, {"decision": "error", "criterion": "", "evidence": str(e)[:120]}, 0, 0
 
@@ -315,8 +347,8 @@ with tabs[2]:
 
             def rerun(r):
                 try:
-                    t, a, b = _create(sysp, f"Title: {r['title']}\nAbstract: {r['abstract']}", 300, temp)
-                    return r["id"], (parse_json(t) or {}).get("decision", "unparseable"), a, b
+                    o, a, b = _create_json(sysp, f"Title: {r['title']}\nAbstract: {r['abstract']}", SCREEN_SCHEMA, 400)
+                    return r["id"], (o or {}).get("decision", "no reply"), a, b
                 except Exception:  # noqa: BLE001
                     return r["id"], "error", 0, 0
 
@@ -358,7 +390,8 @@ Passages:
 Return JSON only, a list:
 [{{"passage": "P1", "code": "TRUST", "quote": "<exact words from the passage>", "rationale": "<one sentence>"}}]"""
         with st.spinner("Coding..."):
-            out = parse_json(ask(sys, prompt, "qualitative coding", 2000))
+            res = ask(sys, prompt, "qualitative coding", 3000, schema=CODE_SCHEMA)
+            out = res.get("codes") if isinstance(res, dict) else None
         if isinstance(out, list):
             norm = lambda s: re.sub(r"\s+", " ", s.lower()).strip(' ".')  # noqa: E731
             full = norm(passages)
