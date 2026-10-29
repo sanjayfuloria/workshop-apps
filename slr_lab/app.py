@@ -119,8 +119,12 @@ def structured_call(system, messages, schema, max_tokens):
     client = get_client()
     if _STRUCT["ok"]:
         try:
+            fmt = {"format": {"type": "json_schema", "schema": strict(schema)}}
             r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=system, messages=messages,
-                                       output_config={"format": {"type": "json_schema", "schema": strict(schema)}})
+                                       output_config=fmt)
+            if getattr(r, "stop_reason", None) == "max_tokens":  # reply was cut off: retry with more room
+                r = client.messages.create(model=MODEL, max_tokens=min(max_tokens * 2, 16000), system=system,
+                                           messages=messages, output_config=fmt)
             text = "".join(b.text for b in r.content if b.type == "text")
             _LAST["text"] = text
             return coerce(parse_json(text), schema), r
@@ -134,8 +138,9 @@ def structured_call(system, messages, schema, max_tokens):
     r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=sys2, messages=messages)
     text = "".join(b.text for b in r.content if b.type == "text")
     data = coerce(parse_json(text), schema)
-    if data is None:  # one retry
-        r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=sys2, messages=messages)
+    if data is None:  # one retry, with more room if the reply was cut off
+        room = min(max_tokens * 2, 16000) if getattr(r, "stop_reason", None) == "max_tokens" else max_tokens
+        r = client.messages.create(model=MODEL, max_tokens=room, system=sys2, messages=messages)
         text = "".join(b.text for b in r.content if b.type == "text")
         data = coerce(parse_json(text), schema)
     _LAST["text"] = text
@@ -198,7 +203,7 @@ def ask(system, user, purpose, max_tokens=1500, temperature=None, schema=None):
     if schema and text is None:
         st.warning("The model replied, but not in the expected format. Please try again.")
         with st.expander("Show the raw reply (for the facilitator)"):
-            st.code(_LAST["text"][:4000] or "(empty)", language=None)
+            st.code(_LAST["text"][:12000] or "(empty)", language=None)
     return text
 
 
@@ -308,13 +313,11 @@ with tabs[0]:
         sys = "You are an information specialist helping with systematic review searches. Be precise. Never invent database field codes you are unsure of; mark them for checking."
         prompt = f"""Review question: {topic}
 
-Return JSON only:
-{{"concepts": [{{"concept": "...", "synonyms": ["..."], "india_specific_terms": ["..."]}}],
-  "scopus": "TITLE-ABS-KEY(...) string",
-  "web_of_science": "TS=(...) string",
-  "cautions": ["things the researcher must check by hand"]}}"""
+Identify the 2 to 4 core concepts. For each, give up to 10 of the most useful synonyms and up to 6 India-specific terms.
+Then draft one Scopus string (TITLE-ABS-KEY) and one Web of Science string (TS=) that combine the concepts with AND.
+Finally list up to 4 cautions the researcher must check by hand. Keep everything focused rather than exhaustive."""
         with st.spinner("Thinking about your concepts..."):
-            out = ask(sys, prompt, "search strategy", 3000, schema=SEARCH_SCHEMA)
+            out = ask(sys, prompt, "search strategy", 8000, schema=SEARCH_SCHEMA)
         if isinstance(out, dict):
             for c in out.get("concepts", []) or []:
                 st.markdown(f"**{c.get('concept','')}**")
@@ -352,7 +355,7 @@ with tabs[1]:
 
         def work(r):
             try:
-                out, tin, tout = _create_json(system_prompt, f"Title: {r['title']}\nAbstract: {r['abstract']}", SCREEN_SCHEMA, 400)
+                out, tin, tout = _create_json(system_prompt, f"Title: {r['title']}\nAbstract: {r['abstract']}", SCREEN_SCHEMA, 1500)
                 return r, out or {"decision": "uncertain", "criterion": "", "evidence": "no structured reply"}, tin, tout
             except Exception as e:  # noqa: BLE001
                 return r, {"decision": "error", "criterion": "", "evidence": str(e)[:120]}, 0, 0
@@ -416,7 +419,7 @@ with tabs[2]:
 
             def rerun(r):
                 try:
-                    o, a, b = _create_json(sysp, f"Title: {r['title']}\nAbstract: {r['abstract']}", SCREEN_SCHEMA, 400)
+                    o, a, b = _create_json(sysp, f"Title: {r['title']}\nAbstract: {r['abstract']}", SCREEN_SCHEMA, 1500)
                     return r["id"], (o or {}).get("decision", "no reply"), a, b
                 except Exception:  # noqa: BLE001
                     return r["id"], "error", 0, 0
@@ -456,10 +459,10 @@ P4: Network is the main problem here in the evening. The phone shows payment pen
 Passages:
 {passages}
 
-Return JSON only, a list:
-[{{"passage": "P1", "code": "TRUST", "quote": "<exact words from the passage>", "rationale": "<one sentence>"}}]"""
+For every code you apply, give the passage label (P1, P2...), the code, the exact words from the passage, and a one-sentence rationale.
+A passage may receive more than one code."""
         with st.spinner("Coding..."):
-            res = ask(sys, prompt, "qualitative coding", 3000, schema=CODE_SCHEMA)
+            res = ask(sys, prompt, "qualitative coding", 6000, schema=CODE_SCHEMA)
             out = res.get("codes") if isinstance(res, dict) else None
             out = [o for o in out if isinstance(o, dict)] if isinstance(out, list) else None
         if isinstance(out, list):
@@ -506,7 +509,7 @@ with tabs[4]:
     st.write("Paste references, one per line, or ask the model to produce some and see how many survive the check. Lookups use Crossref and cost no API credit.")
     if st.button("Ask the model for 6 references on the review question"):
         txt = ask("You are a research assistant.", f"List 6 academic references (APA style, with DOIs) on: {REVIEW_Q}. One per line, no commentary.",
-                  "generate references (hallucination demo)", 900, None)
+                  "generate references (hallucination demo)", 2500, None)
         if txt:
             st.session_state["refs"] = txt.strip()
     refs = st.text_area("References", st.session_state.get("refs",
@@ -539,7 +542,7 @@ with tabs[5]:
             facts["calibration_records"] = len(sc["df"])
         txt = ask("You write concise, accurate methods text for academic journals. Use only the facts given. Do not invent results or citations. Mention that the RAISE recommendations were followed only if the user states it.",
                   f"Draft a 120 to 180 word AI-use disclosure paragraph from these facts:\n{json.dumps(facts, indent=2)}\nAdd one sentence stating that authors take full responsibility for the review.",
-                  "disclosure draft", 600)
+                  "disclosure draft", 2000)
         if txt:
             st.text_area("Draft (edit before use)", txt, height=220)
 
